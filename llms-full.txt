@@ -1,0 +1,1735 @@
+# Stroppy
+
+> Database stress testing powered by k6
+
+This file contains all documentation content in a single document following the llmstxt.org standard.
+
+## Extensibility
+
+
+Stroppy uses a driver registry pattern. Adding support for a new database means implementing a Go interface and registering it. This page walks through the process.
+
+## Driver Interface
+
+Every driver implements four methods:
+
+```go
+// pkg/driver/dispatcher.go
+
+type Driver interface {
+    // Execute a bulk insert operation
+    InsertValues(ctx context.Context, unit *stroppy.InsertDescriptor) (*stats.Query, error)
+
+    // Execute a single SQL query with named parameters
+    RunQuery(ctx context.Context, sql string, args map[string]any) (*stats.Query, error)
+
+    // Clean up resources (close connections, pools, etc.)
+    Teardown(ctx context.Context) error
+
+    // Reconfigure the driver (e.g., inject k6's DialFunc for network metrics)
+    Configure(ctx context.Context, opts Options) error
+}
+```
+
+`InsertValues` receives an `InsertDescriptor` containing the table name, insertion method, column definitions with generation rules, and row count. The driver is responsible for generating values according to the rules and inserting them.
+
+`RunQuery` receives raw SQL with `:param` placeholders already present. The driver must convert them to its native placeholder format and execute the query.
+
+Both return `*stats.Query` which tracks execution time for metrics.
+
+## Step-by-Step: Adding a MySQL Driver
+
+### 1. Create the package
+
+```
+pkg/driver/mysql/
+├── driver.go
+├── query.go
+└── insert.go
+```
+
+### 2. Implement the driver
+
+```go
+// pkg/driver/mysql/driver.go
+package mysql
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+
+    _ "github.com/go-sql-driver/mysql"
+    "go.uber.org/zap"
+
+    stroppy "github.com/stroppy-io/stroppy/pkg/common/proto/stroppy"
+    "github.com/stroppy-io/stroppy/pkg/driver"
+    "github.com/stroppy-io/stroppy/pkg/driver/stats"
+)
+
+// Register this driver at import time
+func init() {
+    driver.RegisterDriver(
+        stroppy.DriverConfig_DRIVER_TYPE_MYSQL,  // Add this to the proto enum
+        func(ctx context.Context, lg *zap.Logger, config *stroppy.DriverConfig) (driver.Driver, error) {
+            return NewDriver(ctx, lg, config)
+        },
+    )
+}
+
+type Driver struct {
+    logger *zap.Logger
+    db     *sql.DB
+}
+
+// Ensure compile-time interface satisfaction
+var _ driver.Driver = new(Driver)
+
+func NewDriver(
+    ctx context.Context,
+    lg *zap.Logger,
+    cfg *stroppy.DriverConfig,
+) (*Driver, error) {
+    db, err := sql.Open("mysql", cfg.GetUrl())
+    if err != nil {
+        return nil, fmt.Errorf("mysql connect: %w", err)
+    }
+
+    if err := db.PingContext(ctx); err != nil {
+        return nil, fmt.Errorf("mysql ping: %w", err)
+    }
+
+    return &Driver{logger: lg, db: db}, nil
+}
+```
+
+### 3. Implement RunQuery
+
+Convert `:param` placeholders to MySQL's `?` syntax:
+
+```go
+// pkg/driver/mysql/query.go
+package mysql
+
+import (
+    "context"
+    "regexp"
+    "time"
+
+    "github.com/stroppy-io/stroppy/pkg/driver/stats"
+)
+
+var paramRegex = regexp.MustCompile(`(?:\s|^|\()(:([a-zA-Z0-9_]+))(?:\s|$|;|,|\))`)
+
+func (d *Driver) RunQuery(
+    ctx context.Context,
+    sql string,
+    args map[string]any,
+) (*stats.Query, error) {
+    // Convert :param to ? and build ordered args slice
+    var orderedArgs []any
+    paramIndex := map[string]int{}
+
+    converted := paramRegex.ReplaceAllStringFunc(sql, func(match string) string {
+        // Extract param name, replace with ?
+        // ... (handle deduplication like the postgres driver)
+        return "?"
+    })
+
+    start := time.Now()
+    _, err := d.db.ExecContext(ctx, converted, orderedArgs...)
+    elapsed := time.Since(start)
+
+    if err != nil {
+        return nil, err
+    }
+    return &stats.Query{Elapsed: elapsed}, nil
+}
+```
+
+### 4. Implement InsertValues
+
+```go
+// pkg/driver/mysql/insert.go
+package mysql
+
+import (
+    "context"
+
+    stroppy "github.com/stroppy-io/stroppy/pkg/common/proto/stroppy"
+    "github.com/stroppy-io/stroppy/pkg/driver/stats"
+)
+
+func (d *Driver) InsertValues(
+    ctx context.Context,
+    unit *stroppy.InsertDescriptor,
+) (*stats.Query, error) {
+    // Generate values according to unit.Params generation rules
+    // Build INSERT statements or use LOAD DATA for bulk
+    // Execute and track timing
+    return nil, nil
+}
+```
+
+### 5. Implement Teardown and Configure
+
+```go
+func (d *Driver) Teardown(_ context.Context) error {
+    return d.db.Close()
+}
+
+func (d *Driver) Configure(_ context.Context, opts driver.Options) error {
+    // Optionally apply k6's DialFunc for network metrics tracking
+    return nil
+}
+```
+
+### 6. Add the driver type enum
+
+In `proto/stroppy/config.proto`, add your driver type to the `DriverType` enum and regenerate the type definitions:
+
+```bash
+make proto
+```
+
+### 7. Register via import
+
+In `cmd/xk6air/module.go`, add a blank import so `init()` runs:
+
+```go
+import (
+    _ "github.com/stroppy-io/stroppy/pkg/driver/mysql"
+    _ "github.com/stroppy-io/stroppy/pkg/driver/postgres"
+)
+```
+
+### 8. Build and test
+
+```bash
+make build
+./build/stroppy run my_mysql_test.ts
+```
+
+## How the Registry Works
+
+The dispatcher is minimal by design:
+
+```go
+var registry = map[stroppy.DriverConfig_DriverType]driverConstructor{}
+
+func RegisterDriver(
+    driverType stroppy.DriverConfig_DriverType,
+    constructor driverConstructor,
+) {
+    registry[driverType] = constructor
+}
+
+func Dispatch(
+    ctx context.Context,
+    lg *zap.Logger,
+    config *stroppy.DriverConfig,
+) (Driver, error) {
+    if constructor, ok := registry[drvType]; ok {
+        return constructor(ctx, lg, config)
+    }
+    return nil, fmt.Errorf("driver type '%s': no registered driver", drvType)
+}
+```
+
+Drivers self-register via Go's `init()` function. The `init()` runs when the package is imported (even as a blank import `_`). This means adding a driver requires zero changes to the dispatcher code &mdash; just implement, register, and import.
+
+## The k6 Module Layer
+
+Between your TypeScript and the Go driver sits the k6 module (`cmd/xk6air/`). It:
+
+1. **Deserializes** your `GlobalConfig` from TypeScript
+2. **Dispatches** to the correct driver via the registry
+3. **Wraps** the driver with per-VU context (each k6 virtual user gets its own driver wrapper)
+4. **Tracks metrics** (insert duration, query duration, error rates)
+5. **Injects** k6's `DialFunc` via `Configure()` so network metrics are captured
+
+You generally don't need to modify this layer when adding a driver. The module calls `driver.Dispatch()` with the config your TypeScript provides, and your registered constructor handles the rest.
+
+## Data Generation in Drivers
+
+When implementing `InsertValues`, your driver receives an `InsertDescriptor` that contains:
+
+- `tableName` &mdash; Target table
+- `count` &mdash; Number of rows to generate
+- `method` &mdash; `PLAIN_QUERY` or `COPY_FROM` (or your own custom method)
+- `params` &mdash; Column definitions with generation rules for each
+- `groups` &mdash; Grouped parameters for tuple generation
+
+Use the `generate` package (`pkg/common/generate/`) to create generators from rules:
+
+```go
+import "github.com/stroppy-io/stroppy/pkg/common/generate"
+
+gen, err := generate.NewValueGenerator(seed, rule)
+value := gen.Next()
+```
+
+The PostgreSQL driver's implementation in `pkg/driver/postgres/insert.go` is a good reference for both plain query and COPY protocol insertion.
+
+---
+
+## Introduction
+
+
+Stroppy is a database stress testing CLI tool built as an extension to [k6](https://k6.io), Grafana's open-source load testing engine. You write test scripts in TypeScript, define data generators with precise distributions, and run benchmarks that produce detailed metrics and HTML reports.
+
+## Why k6?
+
+Database benchmarking tools tend to fall into two camps: simplistic single-threaded query runners, or sprawling frameworks that require their own infrastructure. Stroppy takes a different path by extending k6:
+
+- **Virtual Users (VUs)** &mdash; k6 manages concurrent goroutines that each execute your test script independently. You get real concurrency without thread management.
+- **Scenarios** &mdash; Define exactly how load ramps up, holds steady, or varies over time. Constant VUs, ramping VUs, shared iterations, per-VU iterations &mdash; all built in.
+- **Thresholds** &mdash; Set pass/fail criteria on any metric. If p95 latency exceeds 200ms, the test fails.
+- **Real-time dashboard** &mdash; Watch metrics live in the browser while the test runs.
+- **HTML report export** &mdash; Get a self-contained report at the end of every run.
+- **Ecosystem** &mdash; JSON output, InfluxDB, Prometheus, Datadog, and more output formats work out of the box.
+
+Stroppy adds what k6 lacks for database testing: a driver abstraction, parameterized SQL execution, data generation with statistical distributions, and bulk insertion (including PostgreSQL COPY protocol).
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────┐
+│                  Your Test Script (.ts)           │
+│  ┌─────────────┐  ┌────────────┐  ┌───────────┐  │
+│  │   DriverX    │  │ Generators │  │  k6 APIs  │  │
+│  │  .runQuery() │  │  R / S     │  │ scenarios │  │
+│  │  .insert()   │  │  NewGen()  │  │ thresholds│  │
+│  └──────┬───────┘  └─────┬──────┘  └───────────┘  │
+└─────────┼────────────────┼─────────────────────────┘
+          │                │
+    ┌─────▼────────────────▼─────┐
+    │    k6/x/stroppy module     │
+    │    (Go, compiled into k6)  │
+    └─────┬────────────────┬─────┘
+          │                │
+   ┌──────▼──────┐  ┌──────▼──────┐
+   │   Driver    │  │  Generator  │
+   │  Registry   │  │   Engine    │
+   │  (postgres) │  │ (uniform,   │
+   │             │  │  normal,    │
+   │             │  │  zipfian)   │
+   └──────┬──────┘  └─────────────┘
+          │
+   ┌──────▼──────┐
+   │  PostgreSQL │
+   │   (pgx)     │
+   └─────────────┘
+```
+
+## Installation
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/stroppy-io/stroppy/releases).
+
+### Docker
+
+```bash
+docker pull ghcr.io/stroppy-io/stroppy:latest
+```
+
+### Build from source
+
+Requires Go 1.24.3+:
+
+```bash
+git clone https://github.com/stroppy-io/stroppy.git
+cd stroppy
+make build
+# Binary at ./build/stroppy
+```
+
+## Quick Start
+
+### 1. Generate a workspace
+
+```bash
+stroppy gen --workdir mytest --preset=simple
+```
+
+This creates a directory with:
+- The stroppy binary (or symlink to it)
+- TypeScript test templates and type definitions
+- Helper framework files
+- `package.json` for npm dependencies
+
+Available presets: `simple`, `tpcb`, `tpcc`, `tpcds`, `execute_sql`.
+
+### 2. Install dependencies
+
+```bash
+cd mytest
+npm install
+```
+
+### 3. Run a test
+
+```bash
+# Against local PostgreSQL (default: postgres://postgres:postgres@localhost:5432)
+./stroppy run workloads/simple/simple.ts
+
+# With a custom database URL
+DRIVER_URL="postgres://user:pass@host:5432/mydb" ./stroppy run workloads/simple/simple.ts
+```
+
+### 4. Run with an SQL file
+
+Some workloads pair a TypeScript script with a SQL file that defines the schema and queries:
+
+```bash
+./stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql
+```
+
+### 5. Pass k6 arguments
+
+Everything after `--` is forwarded to k6:
+
+```bash
+./stroppy run simple.ts -- --vus 10 --duration 30s
+```
+
+## A Minimal Test Script
+
+```typescript
+import { Options } from "k6/options";
+import encoding from "k6/x/encoding";
+globalThis.TextEncoder = encoding.TextEncoder;
+globalThis.TextDecoder = encoding.TextDecoder;
+
+import { Teardown } from "k6/x/stroppy";
+import { DriverConfig_DriverType } from "./stroppy.pb.js"; // generated types
+import { DriverX, R } from "./helpers.ts";
+
+export const options: Options = {
+  scenarios: {
+    test: {
+      executor: "shared-iterations",
+      exec: "test",
+      vus: 1,
+      iterations: 1,
+    },
+  },
+};
+
+const driver = DriverX.fromConfig({
+  driver: {
+    url: __ENV.DRIVER_URL || "postgres://postgres:postgres@localhost:5432",
+    driverType: DriverConfig_DriverType.DRIVER_TYPE_POSTGRES,
+    dbSpecific: { fields: [] },
+  },
+});
+
+export function test() {
+  // Run a simple query
+  driver.runQuery("SELECT 1;", {});
+
+  // Run a parameterized query
+  driver.runQuery("SELECT :a + :b", { a: 10, b: 20 });
+}
+
+export function teardown() {
+  Teardown();
+}
+```
+
+## Docker Usage
+
+```bash
+# Run built-in workloads directly
+docker run --network host ghcr.io/stroppy-io/stroppy \
+  run /workloads/simple/simple.ts
+
+# TPC-B benchmark with custom DB
+docker run --network host \
+  -e DRIVER_URL="postgres://user:pass@host:5432/db" \
+  ghcr.io/stroppy-io/stroppy \
+  run /workloads/tpcb/tpcb.ts /workloads/tpcb/tpcb.sql
+
+# Generate a workspace to your host
+docker run -v $(pwd):/workspace ghcr.io/stroppy-io/stroppy \
+  gen --workdir mytest --preset=simple
+```
+
+## Using the k6 Binary Directly
+
+Stroppy is a k6 extension. The build produces both `stroppy` and `k6` binaries:
+
+```bash
+make build
+
+# Use k6 directly with full k6 CLI
+./build/k6 run --vus 10 --duration 30s test.ts
+
+# JSON output
+./build/k6 run --out json=results.json test.ts
+
+# Stroppy commands via k6 extension
+./build/k6 x stroppy run workloads/simple/simple.ts
+```
+
+## Next Steps
+
+- [SQL & Generators](./sql-and-generators) &mdash; Deep dive into parameterized SQL and the data generation system
+- [Extensibility](./extensibility) &mdash; How to add your own database driver
+- [Reports & Workflow](./reports-workflow) &mdash; HTML reports and the iterative testing workflow
+
+---
+
+## FoundationDB Report
+
+# FoundationDB Benchmark Report
+
+:::caution Legacy Documentation
+This report was produced using the **original Stroppy framework**. The methodology, test infrastructure, and tooling differ from the current CLI version.
+:::
+
+## The Problem
+
+Unlike most system software, the database market is as vibrant today as it was ten or twenty years ago. The hardware revolution &mdash; switching from rotating to solid state drives, then from SSD to NVM &mdash; all in a single decade, advance of hyper-converged architecture and multi-cloud create a brave new world for database vendors and consumers.
+
+Parallel to hardware changes, the open source revolution presents users with [hundreds of new database offerings](https://dbdb.io/) and highlights growth of the on-premise database market. A massive shift towards polyglot persistence, cloud and multi-cloud demonstrates even bigger growth both in data volume and variety of processing needs.
+
+Financial institutions have been pioneer adopters of database software, yet surprising laggards with NoSQL and the cloud. Concerns of security, manageability and reliability kept banks conservative.
+
+After a decade of growth, the NoSQL market has matured. MongoDB added transaction support in 2020. CockroachDB was first released in 2017. FoundationDB, founded in 2013, was acquired by Apple and re-released as open source in 2018.
+
+By 2021, with multiple free, horizontally scalable, transactional NoSQL databases available, the market was seeing a tectonic shift: NoSQL no longer means no transactions. Adoption of this advance required industry benchmarks &mdash; and no widely adopted instrument existed to test how well NoSQL databases fare in the historically SQL domain of financial transactions.
+
+## The Test
+
+A credible test needed to prove:
+- ACID properties are preserved in a distributed NoSQL environment, including during node and network failures
+- Applications can scale with cluster size
+- Performance is comparable to vertically scaled DBMS on similar hardware
+
+The test runs a typical financial application: a series of bank money transfers between accounts. The key insight is that **no amount of transfers can change the total balance of all accounts**.
+
+Three steps:
+1. **Data generation** &mdash; Load bank accounts with initial balances. Store total balance as canonical result.
+2. **Money transfers** &mdash; Run parallel transfers between accounts. Step is paralleled with nemesis (network partitions, hardware failures, topology changes).
+3. **Balance verification** &mdash; Download end balances and verify total hasn't changed.
+
+## The Subject and the Environment
+
+[FoundationDB](https://www.foundationdb.org/) is a transactional NoSQL database maintained by Apple under Apache 2.0 license. Its key design property is service-based, non-homogenous architecture &mdash; storage, transaction log, proxy, and coordinator roles can be placed at different nodes.
+
+**Testing goals:**
+- Verify ACID properties
+- Compare performance against PostgreSQL
+- Test horizontal scalability
+
+**Hardware:** Oracle Cloud E3.Flex instances. Network bandwidth 1 Gb/s. Disk bandwidth 1 Gb/s per core.
+
+**Failure injection:** [Chaos-mesh](https://chaos-mesh.org/) for kubernetes.
+
+## Results
+
+### Table 1: Consolidated Results
+
+| # | Vendor | Nodes | VCPU/Node | RAM/Node (GB) | HDD/Node (GB) | Clients | Accounts (M) | Transfers (M) | TPS |
+|---|--------|-------|-----------|---------------|----------------|---------|---------------|----------------|-----|
+| 1 | FDB | 3 | 1 | 8 | 100 | 16 | 10 | 100 | **2,263** |
+| 2 | FDB+chaos | 3 | 2 | 8 | 100 | 16 | 10 | 100 | **2,189** |
+| 3 | FDB | 5 | 1 | 8 | 100 | 512 | 10 | 100 | **7,631** |
+| 4 | FDB+chaos | 5 | 1 | 8 | 100 | 512 | 10 | 100 | **7,528** |
+| 5 | FDB | 5 | 1 | 16 | 100 | 512 | 100 | 100 | **5,782** |
+| 6 | FDB | 20 | 1 | 16 | 100 | 512 | 100 | 100 | **10,854** |
+| 7 | FDB | 5 | 1 | 16 | 100 | 512 | 1,000 | 10 | **3,369** |
+| 8 | PG | 2 | 3 | 30 | 100 | 128 | 10 | 100 | **2,059** |
+| 9 | PG | 2 | 10 | 160 | 100 | 256 | 100 | 100 | **5,915** |
+
+**Key observations:**
+- Additional VCPU doesn't increase throughput for FDB (Run #2 vs #1)
+- Optimal concurrency: 512 clients for FDB, 128-256 for PostgreSQL
+- Not memory bound &mdash; doubling RAM with 10x data set decreased throughput ~30% (Run #5 vs #4)
+- Scaling 4x nodes roughly doubles throughput (Run #6 vs #5)
+- Nemesis runs show no accumulated performance degradation (Runs #2, #4)
+
+### Table 2: Latency
+
+| # | Vendor | Avg (ms) | Max (ms) | p99 (ms) |
+|---|--------|----------|----------|----------|
+| 1 | FDB | 7 | 241 | 45 |
+| 2 | FDB+chaos | 8 | 380 | 52 |
+| 3 | FDB | 67 | 856 | 201 |
+| 4 | FDB+chaos | 71 | 889 | 227 |
+| 5 | FDB | 88 | 934 | 271 |
+| 6 | FDB | 47 | 565 | 82 |
+| 7 | FDB | 151 | 1,267 | 588 |
+| 8 | PG | 62 | 4,511 | 203 |
+| 9 | PG | 43 | 3,568 | 133 |
+
+### Table 3: Data Set Sizes
+
+| Vendor | Accounts (M) | Transfers (M) | Disk Footprint |
+|--------|-------------|---------------|----------------|
+| FDB | 10 | 100 | 18 GB |
+| FDB | 100 | 100 | 32 GB |
+| FDB | 100 | 400 | 88 GB |
+| FDB | 1,000 | 10 | 127 GB |
+| FDB | 100 | 1,000 | 225 GB |
+| PG | 10 | 100 | 71 GB |
+
+### Nemesis Results
+
+Nemesis tests ran on 3-node and 5-node clusters, simulating network partitions and hardware failures:
+
+- Killed one node every two minutes (replaced immediately by Kubernetes operator)
+- Choice was fixed for 3-node, random for 5-node clusters
+- **Result:** ~5 second availability pause during pod failure (FoundationDB moving coordinator role), then normal operation resumed
+- Tests passed with comparable performance and correct resulting balance
+- No accumulated degradation observed during continuous failures
+
+## Conclusions
+
+Over hundreds of hours of testing across different clouds, topologies, and adverse actions:
+
+- **ACID verified** &mdash; Unable to make FoundationDB lose transactions under any test condition
+- **Fault tolerant** &mdash; Database continued working normally after restoring from degraded state
+- **Performance** &mdash; Small cluster comparable to 3-core replicated PostgreSQL
+- **Scalability** &mdash; 4x nodes roughly doubled throughput (not linear, but good for correlated workloads)
+
+The cluster doesn't scale linearly, but the result is considered good for the correlated workload of money transfers. Configurations outside scope: larger clusters (hundreds/thousands of cores), different workload types, background activities like backup/restore.
+
+---
+
+## MongoDB Report
+
+# MongoDB Benchmark Report
+
+:::caution Legacy Documentation
+This report was produced using the **original Stroppy framework**. The methodology, test infrastructure, and tooling differ from the current CLI version.
+:::
+
+## Introduction
+
+MongoDB is a schema-less document-oriented database. A pioneer of the document data model, MongoDB defined much of what we understand under "NoSQL" databases today.
+
+MongoDB's building block for horizontal scaling is the **replica set** &mdash; a set of nodes each having a full copy of the data, with one taking the leading role. When data outgrows a single replica set, another is added and data is redistributed (sharding).
+
+Query routing and execution is managed by a load balancer and configuration servers. The configuration servers can form their own replica set for high availability. Different node roles make MongoDB cluster configuration trickier but more flexible than homogenous clusters.
+
+### Testing Goals
+
+- Check if MongoDB transactions are ACID
+- Check if hardware demands are moderate compared to PostgreSQL and FoundationDB
+- Check if the system scales up and out (doubling/quadrupling cores or shards)
+
+## General Results
+
+:::note
+1. All tests used MongoDB defaults. Configuration tuning never had noticeable impact.
+2. All results refer to MongoDB 4.4. Version 5.0 produced results within error margin. Percona MongoDB Server showed no significant difference.
+3. The Community Operator doesn't support sharding. Tests #1-2 used Community Operator; subsequent tests used Percona Operator.
+4. Hash-based sharding was used (more even distribution, stable tail latency for non-range workloads).
+:::
+
+### Table 1: Key Test Results
+
+| # | VCPU/Node | RAM (GB) | HDD (GB) | Shards | Replicas | Clients | Nodes | Accounts (M) | Transfers (M) | **TPS** |
+|---|-----------|----------|----------|--------|----------|---------|-------|---------------|----------------|---------|
+| 1 | 1 | 8 | 100 | 1 | 3 | 16 | 3 | 10 | 10 | **340** |
+| 2 | 2 | 8 | 100 | 1 | 3 | 16 | 3 | 10 | 10 | **720** |
+| 3 | 4 | 8 | 100 | 1 | 3 | 64 | 3 | 10 | 10 | **1,843** |
+| 4 | 4 | 8 | 100 | 1 | 3 | 128 | 3 | 10 | 10 | **2,661** |
+| 5 | 2 | 8 | 100 | 2 | 3 | 32 | 6 | 10 | 10 | **427** |
+| 6 | 6 | 16 | 100 | 1 | 2+arb | 128 | 3 | 100 | 100 | **2,725** |
+| 7 | 6 | 16 | 100 | 1 | 3 | 128 | 3 | 100 | 100 | **2,761** |
+| 8 | 6 | 12 | 100 | 1 | 2+arb | 128 | 3 | 100 | 100 | **2,592** |
+| 9 | 6 | 12 | 100 | 1 | 3 | 128 | 3 | 100 | 100 | **2,551** |
+| 10 | 2 | 8 | 100 | 2 | 3 | 128 | 6 | 100 | 100 | **575** |
+| 11 | 2 | 8 | 100 | 2 | 3 | 128 | 6 | 100 | 100 | **445** |
+| 12 | 4 | 8 | 100 | 8 | 3 | 128 | 12 | 100 | 100 | **1,171** |
+| 13 | 8 | 16 | 100 | 2 | 3 | 128 | 6 | 1,000 | 10 | **443** |
+| 14 | 8 | 16 | 100 | 4 | 3 | 128 | 12 | 1,000 | 10 | **718** |
+| 15 | 8 | 16 | 100 | 4 | 3 | 128 | 12 | 1,000 | 10 | **670** |
+| 16 | 4 | 8 | 100 | 8 | 3 | 128 | 12 | 1,000 | 10 | **947** |
+| 17 | 12 | 40 | 100 | 1 | 3 | 128 | 3 | 1,000 | 10 | **3,272** |
+| 18 | 3 | 8 | 100 | 2 | 3 | 128 | 6 | 10 | 10 | **653** |
+| 19 | 3 | 8 | 100 | 2 | 3 | 128 | 6 | 10 | 10 | **534** |
+
+### Table 2: Latencies
+
+| # | Median (ms) | Max (ms) | p99 (ms) |
+|---|-------------|----------|----------|
+| 1 | 22 | 401 | 79 |
+| 2 | 47 | 793 | 178 |
+| 3 | 35 | 1,037 | 104 |
+| 4 | 45 | 1,807 | 172 |
+| 5 | 75 | 800 | 217 |
+| 6 | 47 | 2,763 | 173 |
+| 7 | 46 | 2,424 | 171 |
+| 8 | 49 | 26,515 | 169 |
+| 9 | 50 | 2,066 | 221 |
+| 10 | 222 | 4,052 | 801 |
+| 11 | 287 | 6,372 | 1,434 |
+| 12 | 109 | 4,148 | 500 |
+| 13 | 288 | 7,293 | 1,099 |
+| 14 | 178 | 4,137 | 867 |
+| 15 | 190 | 5,917 | 631 |
+| 16 | 135 | 5,578 | 898 |
+| 17 | 39 | 1,824 | 111 |
+| 18 | 195 | 4,990 | 662 |
+| 19 | 239 | 2,972 | 657 |
+
+### Table 3: Data Set Sizes
+
+| Accounts (M) | Transfers (M) | MongoDB | FoundationDB |
+|--------------|---------------|---------|--------------|
+| 10 | 10 | 3 GB | 3 GB |
+| 100 | 100 | 24 GB | 32 GB |
+| 1,000 | 10 | 136 GB | 127 GB |
+
+### Key Findings
+
+**Scale up, not out.** Transaction performance in MongoDB is bound to the throughput of a single node and does not improve much by adding replica sets.
+
+- For memory-resident workloads (tests #1-#4): doubling cores gives proportional speedup
+- Splitting the same compute across replica sets gives *lower* performance (test #5)
+- Once data exceeds RAM, performance drops discretely then stabilizes
+- Best result (#17): single replica set, 12 cores, 40GB RAM = 3,272 TPS
+- CPU-bound on master replica (>80% utilization)
+
+**Sharding insights:**
+- Going from 2 to 4 shards with 4x CPU gave only 62% performance gain
+- XFS was ~22% faster than EXT4 for memory-bound workloads, 7% slower for disk-bound
+- Sharded clusters require separate balancer and config server replica sets (hidden cost)
+
+**Optimal concurrency:** 128 clients (lower than PostgreSQL at 256 or FoundationDB at 512).
+
+## Failover Tests
+
+Tests #18 and #19 used 2-replica-set clusters:
+
+| Scenario | Result |
+|----------|--------|
+| Restart any replica on any shard every 2 min | **Failed** &mdash; couldn't complete data loading |
+| Restart one predefined replica on one shard every 2 min | **Failed** &mdash; couldn't complete data loading |
+| Disconnect one predefined replica on one shard every 2 min | **Failed** &mdash; TransactionExceededLifetimeLimitSeconds |
+| Restart one predefined replica on *different* shards every 2 min | **Passed** (test #18) |
+| 100% network degradation between two replicas on same shard every 2 min | **Passed** (test #19) |
+
+Brief network partitions don't cause noticeable degradation. However, more aggressive failure scenarios prevented test completion.
+
+## Final Remarks
+
+1. Default durability must be elevated to `w:majority` with `wtimeout` on. Without this, inconsistent data was observed.
+2. Multi-document transactions must read from the master and use `writeConcernMajorityJournalDefault`.
+3. WiredTiger uses MVCC, but MongoDB's query layer adds multi-granularity locking (possibly legacy from MMAPv1).
+
+## Conclusions
+
+Over 100 test runs in 3 months. Comparison with FoundationDB and PostgreSQL:
+
+| Comparison | MongoDB | Competitor | Ratio |
+|-----------|---------|------------|-------|
+| Test #1 (minimal config) | 340 TPS | FDB: 2,263 TPS | **6.7x slower** |
+| Test #5 (small scale-out) | 427 TPS | FDB: ~2,200 TPS | **~5x slower** |
+| Test #7 (medium, best single RS) | 2,761 TPS | FDB: 5,782 TPS | **2.1x slower** |
+| Test #7 (medium, best single RS) | 2,761 TPS | PG: ~4,663 TPS | **1.7x slower** |
+| Test #17 (big, best overall) | 3,272 TPS | FDB: 3,369 TPS | **Comparable** |
+| Test #17 hardware | 36 cores, 120GB RAM | FDB: 5 cores, 60GB RAM | **7x more resources** |
+
+For multi-document transaction workloads, MongoDB scales best vertically. Even in large clusters, CPU and disk were near 100% utilization. Horizontal scaling showed sub-linear improvement insufficient to justify the added complexity.
+
+---
+
+## Historical Overview
+
+
+:::caution Legacy Documentation
+This section documents the **original Stroppy framework** &mdash; a cloud-based database testing platform with Kubernetes deployment, Terraform provisioning, and Grafana integration. This version has been superseded by the current CLI tool.
+
+The content is preserved here for historical reference and for users who may still encounter the original framework.
+:::
+
+## What Was Stroppy (v1)?
+
+Stroppy was a framework for testing various types of databases. It allowed you to deploy a cluster in the cloud, run load tests and simulate different failures, such as network unavailability of one of the nodes in the cluster.
+
+To complicate the task for the DBMS, Stroppy could deliberately break the DB cluster, because in the real world failures happen much more often than we want. And for horizontally scalable databases this happens even more often, since a larger number of physical nodes gives more points of failure.
+
+Support was implemented for **FoundationDB**, **MongoDB**, **CockroachDB** and **PostgreSQL** (used as a system-wide measure to compare everything else with).
+
+Stroppy was integrated with **Grafana** for test result analysis. After each run it automatically collected an archive with the database metrics, scaled by the time of running.
+
+## Main Features
+
+- Deployment of a cluster of virtual machines in the selected cloud via Terraform (Yandex.Cloud and Oracle.Cloud)
+- Deployment of a Kubernetes cluster inside the VM cluster
+- Deployment of the selected DBMS in the running cluster
+- Collecting statistics from Grafana (k8s cluster metrics and VM system metrics: CPU, RAM, storage)
+- Managing test parameters and deployment configuration
+- Running tests on demand from CLI
+- Logging of test progress (current and final latency, RPS)
+- Deleting a cluster of virtual machines
+- Deployment of multiple clusters from a single local machine with isolated monitoring
+
+## The Banking Test
+
+The core test methodology was an elegant "banking" integrity test:
+
+1. **Account Loading** &mdash; Fill the database with records about bank accounts with initial balances. Calculate and store the total balance as a canonical/expected result.
+
+2. **Money Transfers** &mdash; Simulate a series of parallel transfers from one account to another within DBMS transactions. Transfers run concurrently and can use the same source or target account.
+
+3. **Balance Verification** &mdash; Calculate the total balance of all accounts after transfers. The total must not change, regardless of failures, network partitions, or concurrent access.
+
+This test verified both ACID properties and performance under stress, including chaos testing with [chaos-mesh](https://chaos-mesh.org/).
+
+## Supported Databases
+
+| Database | Status | Notes |
+|----------|--------|-------|
+| PostgreSQL | Reference baseline | Used for comparison |
+| FoundationDB | Fully tested | See [FoundationDB Report](./fdb-report) |
+| MongoDB | Fully tested | See [MongoDB Report](./mongodb-report) |
+| CockroachDB | Partially tested | Limited results |
+
+## How It Differs from Current Stroppy
+
+| Aspect | Original (v1) | Current CLI |
+|--------|---------------|-------------|
+| Deployment | Cloud VMs via Terraform + Kubernetes | Local CLI tool |
+| Test scripts | Go-based, fixed workloads | TypeScript, user-defined |
+| Load engine | Custom goroutine pool | k6 |
+| Database support | FDB, MongoDB, CockroachDB, PostgreSQL | PostgreSQL (extensible) |
+| Data generation | Built-in banking model | Configurable generators |
+| Reporting | Grafana metrics archives | k6 HTML reports |
+| Infrastructure | Required cloud accounts | Runs anywhere |
+
+The current Stroppy CLI focuses on being a lightweight, developer-friendly tool that inherits k6's battle-tested load generation while adding database-specific capabilities.
+
+---
+
+## User Guide (Legacy)
+
+
+:::caution Legacy Documentation
+This is the user guide for the **original Stroppy framework**. For the current CLI tool, see the [Introduction](/docs/introduction).
+:::
+
+## Introduction
+
+[Stroppy](http://github.com/picodata/stroppy) was a framework for testing various databases. It allowed you to deploy a cluster in the cloud, run load tests and simulate, for example, network unavailability of one of the nodes in the cluster.
+
+The "banking" test verified data integrity: fill the database with accounts, simulate parallel money transfers, then verify the total balance hasn't changed. To complicate the task, Stroppy could deliberately break the DB cluster using chaos testing.
+
+Supported databases: FoundationDB, MongoDB, CockroachDB and PostgreSQL.
+
+**Important**: This instruction was relevant for Ubuntu OS >=18.04.
+
+## Commands
+
+### Common base keys
+
+- `log-level` &mdash; Logging level: trace, debug, info, warn, error, fatal, panic
+- `dbtype` &mdash; DBMS name: `postgres`, `fdb`, `mongodb`, `cockroach`
+- `url` &mdash; Connection string to the database
+
+### Cluster deployment (`deploy`)
+
+- `cloud` &mdash; Cloud provider: `yandex` or `oracle`
+- `flavor` &mdash; Configuration from templates.yaml: small, standard, large, xlarge, xxlarge, maximum
+- `nodes` &mdash; Number of VM cluster nodes
+- `dir` &mdash; Directory with configuration files
+
+```bash
+./bin/stroppy deploy --cloud oracle --flavor small --nodes 4 \
+  --dir docs/examples/deploy-oracle-3node-2cpu-8gbRAM-100gbStorage --log-level debug
+```
+
+### Account loading (`pop`)
+
+- `count, n` &mdash; Number of accounts (default: 100000)
+- `workers, w` &mdash; Number of workers (default: 4 * runtime.NumCPU())
+- `banRangeMultiplier, r` &mdash; BIC/BAN ratio coefficient (default: 1.1)
+- `stat-interval, s` &mdash; Statistics interval (default: 10s)
+- `sharded` &mdash; Use sharding for MongoDB (default: false)
+- `add-pool, a` &mdash; Additional connection pool size (default: 0)
+
+```bash
+./bin/stroppy pop --url fdb.cluster --count 5000 --w 512 --dbtype=fdb
+```
+
+### Money transfers (`pay`)
+
+- `zipfian` &mdash; Use Zipfian distribution (default: false)
+- `check` &mdash; Verify balance after test (default: true)
+
+```bash
+./bin/stroppy pay --url fdb.cluster --check --count=100000
+```
+
+### Chaos testing
+
+- `kube-master-addr` &mdash; Internal IP of the k8s master node
+- `chaos-parameter` &mdash; Chaos-mesh script name (without .yaml)
+
+```bash
+./bin/stroppy pay --url fdb.cluster --check --count=100000 \
+  --kube-master-addr=10.1.20.109 --chaos-parameter=fdb-cont-kill-first
+```
+
+## Ban Range Multiplier
+
+The `banRangeMultiplier` (brm) defines the ratio of BAN (Bank Account Number) per BIC (Bank Identifier Code):
+
+- Number of BICs ≈ sqrt(count)
+- Number of BANs = (Nbic * brm) / sqrt(count)
+- If Nban * Nbic > count, more (BIC, BAN) combinations are generated than stored
+- Recommended range: 1.01 to 1.1
+
+## Testing Scenario
+
+### Stage 1: Account Loading
+
+Accounts are generated using a built-in generator that may produce duplicates. Only unique records are stored. The number of successfully uploaded records matches the specified count.
+
+```
+[Nov 17 15:23:07.334] Done 10000 accounts, 0 errors, 16171 duplicates
+[Nov 17 15:23:07.342] Total time: 21.378s, 467 t/sec
+[Nov 17 15:23:07.342] Latency min/max/avg: 0.009s/0.612s/0.099s
+[Nov 17 15:23:07.342] Latency 95/99/99.9%: 0.187s/0.257s/0.258s
+[Nov 17 15:23:07.344] Calculating the total balance...
+[Nov 17 15:23:07.384] Persisting the total balance...
+[Nov 17 15:23:07.494] Total balance: 4990437743
+```
+
+### Stage 2: Money Transfers
+
+Parallel transfers between accounts. Workers encountering retryable errors pause briefly and retry with a new account.
+
+```
+[Oct 15 16:11:12.872] Total time: 26.486s, 377 t/sec
+[Oct 15 16:11:12.872] Latency min/max/avg: 0.001s/6.442s/0.314s
+[Oct 15 16:11:12.872] Latency 95/99/99.9%: 0.575s/3.268s/6.407s
+[Oct 15 16:11:12.872] Errors: 0, Retries: 0, Recoveries: 0, Not found: 1756, Overdraft: 49
+[Oct 15 16:11:12.872] Calculating the total balance...
+[Oct 15 16:11:12.922] Final balance: 4930494048
+```
+
+### Stage 3: Balance Verification
+
+Total balance is compared with the stored canonical result.
+
+**Counters:**
+- `Duplicates` &mdash; Data duplication errors (account loading)
+- `Not found` &mdash; Account not found in database (transfers)
+- `Overdraft` &mdash; Insufficient balance for transfer amount
+- `Retries` &mdash; Operations retried after transient errors
+- `Errors` &mdash; Fatal errors that stopped a worker
+
+## The Data Model
+
+Using PostgreSQL as an example:
+
+| Table | Column | Description |
+|-------|--------|-------------|
+| **account** | bic | Account BIC (TEXT) |
+| | ban | Account BAN (TEXT) |
+| | balance | Account balance (DECIMAL) |
+| **transfers** | transfer_id | Transfer ID (UUID) |
+| | src_bic | Source BIC (TEXT) |
+| | src_ban | Source BAN (TEXT) |
+| | dst_bic | Destination BIC (TEXT) |
+| | dst_ban | Destination BAN (TEXT) |
+| | amount | Transfer amount (DECIMAL) |
+| **checksum** | name | Balance name (TEXT) |
+| | amount | Balance value (DECIMAL) |
+| **settings** | key | Parameter name (TEXT) |
+| | value | Parameter value (TEXT) |
+
+Primary key for accounts: (bic, ban). Primary key for transfers: transfer_id (UUID).
+
+For PostgreSQL and MongoDB, the transfer method implemented lock order control via lexicographic comparison of BIC/BAN pairs to prevent deadlocks.
+
+## Compilation and Build
+
+Three build options were available:
+
+### 1. Run from ready container
+
+Required a compiled Stroppy binary. Used the pre-built container from the repository.
+
+### 2. Build container without compilation
+
+Required Docker. Built the container from the Dockerfile in the repository.
+
+### 3. Compile from source
+
+Required Go, make, gcc, Docker, FoundationDB client libraries, and Terraform.
+
+```bash
+git clone git@github.com:picodata/stroppy.git
+cd stroppy
+make all
+```
+
+## Deployment in Minikube
+
+For local testing, Stroppy could be deployed in Minikube with PostgreSQL:
+
+```bash
+minikube config set memory 6144
+minikube config set cpus 4
+minikube start
+
+git clone https://github.com/picodata/stroppy.git && cd stroppy
+make all
+
+kubectl apply -f docs/examples/deploy-minikube-local/cluster/stroppy-secret.yaml
+kubectl apply -f docs/examples/deploy-minikube-local/cluster/stroppy-manifest.yaml
+./docs/examples/deploy-minikube-local/databases/postgres/deploy_operator.sh
+
+kubectl exec --stdin --tty stroppy-client -- /bin/bash
+stroppy pop --url postgres://stroppy:stroppy@acid-postgres-cluster/stroppy?sslmode=disable \
+  --count 5000 --run-as-pod --kube-master-addr=8.8.8.8 --dir .
+```
+
+## Usage Notes
+
+1. Oracle.Cloud and Yandex.Cloud had different deployment procedures (node counting, disk mounting)
+2. FoundationDB required manual copying of `fdb.cluster` file between pods
+3. Monitoring archive creation took ~30 minutes
+4. FoundationDB statistics were collected via `status json` command
+5. Multiple clusters required separate repository copies to avoid configuration conflicts
+
+---
+
+## Reports & Workflow
+
+
+Stroppy inherits k6's reporting capabilities. This page covers the built-in HTML report generation, the real-time web dashboard, and a practical workflow for iterative database benchmarking.
+
+## k6 Web Dashboard & HTML Reports
+
+Since k6 v0.49.0, there are two built-in reporting features that work out of the box with Stroppy:
+
+### Real-time web dashboard
+
+Watch your test metrics live in the browser:
+
+```bash
+K6_WEB_DASHBOARD=true stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql
+```
+
+This opens a web dashboard (default: `http://localhost:5665`) showing real-time graphs of:
+- Request rate (queries/second)
+- Response time distribution
+- Active virtual users
+- Custom metrics (insert duration, query duration, error rates)
+
+### HTML report export
+
+Generate a self-contained HTML report at the end of a test run:
+
+```bash
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/my-report.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql
+```
+
+The HTML report includes the same detailed graphs from the dashboard, frozen at the end of the test. It's a single file &mdash; no server needed. Open it directly in any browser.
+
+### Both at once
+
+You can watch live and save the report simultaneously:
+
+```bash
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/baseline.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql
+```
+
+## The Iterative Benchmarking Workflow
+
+Here's a practical workflow for database developers: test, patch, retest, compare.
+
+### The scenario
+
+You're optimizing a PostgreSQL database &mdash; tuning indexes, rewriting queries, adjusting configuration. You want to measure the impact of each change with reproducible benchmarks.
+
+### Step 1: Establish a baseline
+
+```bash
+mkdir -p reports
+
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/00-baseline.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --duration 10m
+```
+
+Open `reports/00-baseline.html` in a browser tab. This is your reference point.
+
+### Step 2: Make a change and retest
+
+Apply your first optimization (e.g., add an index, tune `work_mem`), then run the same test:
+
+```bash
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/01-add-covering-index.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --duration 10m
+```
+
+### Step 3: Compare side by side
+
+Open both reports in separate browser windows and tile them:
+
+```bash
+# Linux (xdg-open)
+xdg-open reports/00-baseline.html &
+xdg-open reports/01-add-covering-index.html &
+
+# macOS
+open reports/00-baseline.html
+open reports/01-add-covering-index.html
+```
+
+Each report is self-contained with its own interactive charts. Tile two browser windows and compare response time distributions, throughput curves, and error rates.
+
+### Step 4: Iterate
+
+Keep going. Name reports after your changes:
+
+```bash
+# After tuning shared_buffers
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/02-shared-buffers-2gb.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --duration 10m
+
+# After rewriting a stored procedure
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT=reports/03-optimized-tpcb-proc.html \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --duration 10m
+```
+
+### Step 5: Name after commits
+
+For serious optimization work, name reports after git commits:
+
+```bash
+COMMIT=$(git rev-parse --short HEAD)
+MSG=$(git log -1 --pretty=%s | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 50)
+
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT="reports/${COMMIT}-${MSG}.html" \
+  stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --duration 10m
+```
+
+This produces files like:
+```
+reports/
+  a1b2c3d-add-covering-index.html
+  e4f5g6h-tune-shared-buffers.html
+  i7j8k9l-optimize-tpcb-proc.html
+  m0n1o2p-enable-parallel-query.html
+```
+
+### Step 6: Review your collection
+
+At the end of an optimization sprint, you have a folder of self-contained HTML reports, each named after a commit. Open them in separate tabs or windows to review the progression:
+
+```bash
+# Open all reports
+for f in reports/*.html; do xdg-open "$f" & done
+```
+
+## Helper Script
+
+Here's a convenience script you can save as `bench.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPORTS_DIR="${REPORTS_DIR:-reports}"
+DURATION="${DURATION:-10m}"
+WORKLOAD="${1:-workloads/tpcb/tpcb.ts}"
+SQL_FILE="${2:-workloads/tpcb/tpcb.sql}"
+
+mkdir -p "$REPORTS_DIR"
+
+# Build report name from git state
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  COMMIT=$(git rev-parse --short HEAD)
+  MSG=$(git log -1 --pretty=%s | tr ' ' '-' | tr -cd '[:alnum:]-' | head -c 50)
+  DIRTY=$(git diff --quiet && echo "" || echo "-dirty")
+  REPORT_NAME="${COMMIT}-${MSG}${DIRTY}"
+else
+  REPORT_NAME="run-$(date +%Y%m%d-%H%M%S)"
+fi
+
+REPORT_PATH="${REPORTS_DIR}/${REPORT_NAME}.html"
+
+echo "Running benchmark: ${REPORT_NAME}"
+echo "Report will be saved to: ${REPORT_PATH}"
+echo "Duration: ${DURATION}"
+echo ""
+
+K6_WEB_DASHBOARD=true \
+K6_WEB_DASHBOARD_EXPORT="$REPORT_PATH" \
+  stroppy run "$WORKLOAD" "$SQL_FILE" \
+  -- --duration "$DURATION"
+
+echo ""
+echo "Report saved: ${REPORT_PATH}"
+echo "Open with: xdg-open ${REPORT_PATH}"
+```
+
+Usage:
+
+```bash
+chmod +x bench.sh
+
+# Run with defaults (TPC-B, 10 minutes)
+./bench.sh
+
+# Custom workload and duration
+DURATION=30m ./bench.sh workloads/tpcc/tpcc.ts workloads/tpcc/tpcc.sql
+```
+
+## JSON Output for Programmatic Analysis
+
+For automated comparison or CI pipelines, export raw metrics as JSON:
+
+```bash
+# Using the k6 binary directly
+./build/k6 run \
+  --out json=reports/results.json \
+  workloads/tpcb/tpcb.ts
+
+# Or pass through stroppy
+stroppy run workloads/tpcb/tpcb.ts workloads/tpcb/tpcb.sql \
+  -- --out json=reports/results.json
+```
+
+The JSON output contains every metric data point and can be ingested into InfluxDB, Prometheus, or processed with `jq` for quick comparisons.
+
+## Stroppy-Specific Metrics
+
+Beyond standard k6 metrics, Stroppy tracks:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `insert_duration` | Trend | Time spent on bulk insert operations (ms) |
+| `insert_error_rate` | Rate | Fraction of failed insert operations |
+| `run_query_duration` | Trend | Time spent on individual query execution (ms) |
+| `run_query_count` | Counter | Total number of queries executed |
+| `run_query_error_rate` | Rate | Fraction of failed queries |
+
+These appear in both the web dashboard and HTML reports alongside standard k6 metrics (http_req_duration, iterations, vus, etc.).
+
+## OpenTelemetry Export
+
+For integration with your existing observability stack, Stroppy supports OTLP metrics export:
+
+```typescript
+const driver = DriverX.fromConfig({
+  driver: {
+    url: __ENV.DRIVER_URL || "postgres://postgres:postgres@localhost:5432",
+    driverType: DriverConfig_DriverType.DRIVER_TYPE_POSTGRES,
+    dbSpecific: { fields: [] },
+  },
+  exporter: {
+    name: "stroppy-bench",
+    otlpExport: {
+      otlpGrpcEndpoint: "localhost:4317",
+      otlpEndpointInsecure: true,
+    },
+  },
+});
+```
+
+This sends metrics to any OTLP-compatible backend (Jaeger, Grafana Tempo, etc.) for correlation with your application traces.
+
+## Tips
+
+- **Keep test duration consistent** across runs for fair comparison. 10 minutes is a good default for TPC-B.
+- **Use the same scale factor** when comparing. Set `SCALE_FACTOR` explicitly.
+- **Warm up the database** before the measured run, or include a ramp-up scenario.
+- **Name reports descriptively.** Future-you will thank present-you.
+- **Commit your test scripts** alongside your database code. They're part of the project.
+
+---
+
+## SQL & Generators
+
+
+Stroppy provides two core primitives for database testing: **parameterized SQL execution** and **data generation with statistical distributions**. This page covers both in depth.
+
+## Parameterized Queries
+
+### The `:param` syntax
+
+Stroppy uses `:paramName` syntax for query parameters. The driver converts these to PostgreSQL-style `$1, $2, ...` placeholders at execution time.
+
+```typescript
+driver.runQuery("SELECT :value + :second", {
+  value: 100,
+  second: 50,
+});
+// Executes: SELECT $1 + $2   with args [100, 50]
+```
+
+Parameters are deduplicated &mdash; the same name used multiple times maps to the same positional argument:
+
+```typescript
+driver.runQuery("SELECT :x + :x", { x: 42 });
+// Executes: SELECT $1 + $1   with args [42]
+```
+
+### Type casting
+
+PostgreSQL `::` casts work naturally since the parser distinguishes `:param` from `::`:
+
+```typescript
+driver.runQuery("SELECT :a::int + :b::int", { a: 34, b: 35 });
+// Executes: SELECT $1::int + $2::int   with args [34, 35]
+```
+
+### Argument validation
+
+The driver validates that:
+- Every `:param` in the SQL has a corresponding key in the args object
+- No extra keys are provided that don't appear in the SQL
+
+Both cases produce clear error messages.
+
+## Structured SQL Files
+
+For larger workloads, Stroppy supports structured SQL files with named sections and queries. This keeps your SQL organized and your TypeScript clean.
+
+### Syntax
+
+```sql
+--+ section cleanup
+--= drop_branches
+DROP TABLE IF EXISTS branches CASCADE;
+--= drop_accounts
+DROP TABLE IF EXISTS accounts CASCADE;
+
+--+ section create_schema
+--= create_branches
+CREATE TABLE branches (
+    bid INTEGER NOT NULL PRIMARY KEY,
+    bbalance INTEGER,
+    filler CHAR(88)
+);
+
+--= create_accounts
+CREATE TABLE accounts (
+    aid INTEGER NOT NULL PRIMARY KEY,
+    bid INTEGER,
+    abalance INTEGER,
+    filler CHAR(84)
+);
+
+--+ section workload
+--= transfer
+SELECT transfer(:src_aid, :dst_aid, :amount);
+```
+
+- `--+ section_name` &mdash; Starts a new section (group of queries)
+- `--= query_name` &mdash; Names the next query
+- Regular `--` comments are stripped
+
+### Using in TypeScript
+
+```typescript
+import { parse_sql_with_groups } from "./parse_sql.js";
+
+// open() is a k6 built-in that reads files at init time
+const sections = parse_sql_with_groups(open(__ENV.SQL_FILE));
+
+export function setup() {
+  // Run all queries in the cleanup section
+  sections["section cleanup"].forEach((query) => driver.runQuery(query, {}));
+
+  // Run schema creation
+  sections["section create_schema"].forEach((query) => driver.runQuery(query, {}));
+}
+
+export function workload() {
+  // Run a specific named query with parameters
+  driver.runQuery("SELECT transfer(:src, :dst, :amt)", {
+    src: srcGen.next(),
+    dst: dstGen.next(),
+    amt: amtGen.next(),
+  });
+}
+```
+
+Each `ParsedQuery` object has:
+- `name` &mdash; The query name from `--=`
+- `sql` &mdash; The raw SQL string
+- `type` &mdash; Detected type: `"CreateTable"`, `"Insert"`, `"Select"`, or `"Other"`
+- `params` &mdash; Extracted parameter names
+
+## Data Generators
+
+Stroppy's generation system is built around two namespaces &mdash; `R` for random values and `S` for unique sequences &mdash; designed so that a column definition reads like a declaration of what data it should hold. Generators are seeded for reproducibility: the same seed and rules produce the same data every time.
+
+### The `R` and `S` design
+
+The idea is that you describe each column's data shape right where you use it. `R` (random) and `S` (sequence) both use the same overloaded signatures &mdash; pass one argument for a constant, two for a range, and an optional alphabet for strings:
+
+```typescript
+// R = random values, S = unique/sequential values
+// Both share the same call signatures
+
+R.int32(42)           // constant 42 every time
+R.int32(1, 1000)      // random integer in [1, 1000]
+
+S.int32(1, 100000)    // 1, 2, 3, ... 100000 (unique, sequential)
+
+R.str("hello")        // constant string
+R.str(10)             // random 10-char string, English alphabet
+R.str(5, 20)          // random length between 5 and 20
+R.str(5, 20, AB.enNum)// alphanumeric
+
+S.str(10)             // unique 10-char strings
+S.str(5, 20, AB.enNum)// unique, alphanumeric, variable length
+```
+
+The distinction matters: `S` generators are for primary keys and unique columns where every value must be different. `R` generators are for everything else &mdash; foreign keys, filler data, random balances.
+
+### Full `R` reference
+
+```typescript
+// Strings
+R.str("hello")                 // constant
+R.str(10)                      // random, length 10, English
+R.str(10, AB.en)               // explicit alphabet
+R.str(5, 20)                   // variable length
+R.str(5, 20, AB.enNum)         // variable length, alphanumeric
+
+// Integers
+R.int32(42)                    // constant
+R.int32(1, 1000)               // random in range
+
+// Floats and doubles
+R.float(3.14)                  // constant
+R.float(0.0, 100.0)            // random range
+R.double(2.718)                // constant
+R.double(0.0, 1.0)             // random range
+
+// Booleans (ratio = probability of true)
+R.bool(0.5)                    // 50% true
+R.bool(1.0)                    // always true
+R.bool(0.5, true)              // unique sequence: [false, true]
+
+// Dates
+R.datetimeConst(new Date("2024-01-01"))
+```
+
+### Full `S` reference
+
+```typescript
+S.int32(1, 100000)             // 1, 2, 3, ... (for primary keys)
+S.str(10)                      // unique strings, length 10
+S.str(5, 20, AB.enNum)         // unique, variable length, alphanumeric
+```
+
+### Alphabets (`AB`)
+
+Built-in character sets for string generation:
+
+| Alphabet | Characters |
+|----------|-----------|
+| `AB.en` | `a-z`, `A-Z` |
+| `AB.enNum` | `a-z`, `A-Z`, `0-9` |
+| `AB.num` | `0-9` |
+| `AB.enUpper` | `A-Z` |
+| `AB.enSpc` | `a-z`, `A-Z`, space |
+| `AB.enNumSpc` | `a-z`, `A-Z`, `0-9`, space |
+
+### Standalone generators with `NewGen`
+
+When you need a generator as a standalone object (e.g., to call `.next()` in a loop), use `NewGen()`. The seed controls reproducibility:
+
+```typescript
+import { NewGen, NewGroupGen, R } from "./helpers.ts";
+
+const aidGen = NewGen(0, R.int32(1, 100000));
+const deltaGen = NewGen(1, R.int32(-5000, 5000));
+
+export function workload() {
+  driver.runQuery("SELECT transfer(:aid, :delta)", {
+    aid: aidGen.next(),
+    delta: deltaGen.next(),
+  });
+}
+```
+
+Different seeds produce independent streams. Same seed + same rule = same sequence. This makes tests reproducible while allowing multiple independent generators in the same script.
+
+### Group generators (Tuples)
+
+Group generators produce tuples &mdash; all parameters advance together on each `.next()` call. This is useful when columns are logically related and you want their values to form coherent combinations:
+
+```typescript
+const groupGen = NewGroupGen(2, {
+  params: R.params({
+    id: S.int32(1, 100),
+    name: S.str(10),
+    active: R.bool(1, true),
+  }),
+});
+
+// Each call returns an array of values in parameter order
+for (let i = 0; i < 100; i++) {
+  const [id, name, active] = groupGen.next();
+  console.log(id, name, active);
+}
+```
+
+## Bulk Insertion
+
+`DriverX.insert()` combines data generation with bulk loading in a single call. You declare the table, the row count, and a generation rule for each column &mdash; Stroppy handles the rest.
+
+The API is overloaded for convenience: you can either pass the table name, count, and column rules as separate arguments, or pass a full descriptor object for advanced cases.
+
+### The ergonomic form
+
+```typescript
+driver.insert("table_name", rowCount, {
+  method: InsertMethod.PLAIN_QUERY,  // or COPY_FROM
+  params: {
+    column_name: R.int32(1, 100),    // generation rule per column
+  },
+});
+```
+
+This is the common case. Each key in `params` maps to a column, and its value is a generation rule (`R.*` or `S.*`) that produces data for that column.
+
+### PLAIN_QUERY vs COPY_FROM
+
+**PLAIN_QUERY** generates individual INSERT statements. Straightforward, works everywhere:
+
+```typescript
+driver.insert("users", 10000, {
+  method: InsertMethod.PLAIN_QUERY,
+  params: {
+    id: S.int32(1, 10000),
+    name: R.str(5, 20, AB.en),
+    email: R.str(10, 30, AB.enNum),
+    balance: R.float(0.0, 10000.0),
+  },
+});
+```
+
+**COPY_FROM** uses PostgreSQL's COPY protocol for maximum throughput &mdash; typically 5-10x faster than individual inserts. Use this for loading large data sets:
+
+```typescript
+driver.insert("accounts", 1000000, {
+  method: InsertMethod.COPY_FROM,
+  params: {
+    aid: S.int32(1, 1000000),
+    bid: R.int32(1, 10),
+    abalance: R.int32(0),
+    filler: R.str(84, AB.en),
+  },
+});
+```
+
+Notice how the column definitions read naturally: `aid` is a sequential integer from 1 to 1M (primary key), `bid` is a random integer from 1 to 10 (foreign key), `abalance` starts at 0 (constant), and `filler` is an 84-character random string.
+
+### Grouped columns
+
+When some columns form a logical group &mdash; like a composite foreign key, or columns that should produce correlated combinations &mdash; use `groups`:
+
+```typescript
+driver.insert("orders", 50000, {
+  method: InsertMethod.COPY_FROM,
+  params: {
+    oid: S.int32(1, 50000),
+    amount: R.float(1.0, 999.99),
+  },
+  groups: {
+    customer: {
+      cid: R.int32(1, 1000),
+      region: R.int32(1, 5),
+    },
+  },
+});
+```
+
+Columns within a group are generated together as tuples, ensuring coherent combinations. Columns in `params` are generated independently.
+
+## Putting It All Together: TPC-B Example
+
+Here's a condensed version of the built-in TPC-B workload showing SQL files, generators, and bulk insertion working together:
+
+```typescript
+import { Options } from "k6/options";
+import { DriverConfig_DriverType, InsertMethod, Status } from "./stroppy.pb.js";
+import { DriverX, NewGen, R, S, Step } from "./helpers.ts";
+import { parse_sql_with_groups } from "./parse_sql.js";
+
+const SCALE = +(__ENV.SCALE_FACTOR || 1);
+const ACCOUNTS = 100000 * SCALE;
+
+export const options: Options = {
+  setupTimeout: "5h",
+  scenarios: {
+    tpcb: {
+      executor: "constant-vus",
+      exec: "tpcb",
+      vus: 10,
+      duration: __ENV.DURATION || "1h",
+    },
+  },
+};
+
+// Initialize driver with connection pooling
+const driver = DriverX.fromConfig({
+  driver: {
+    url: __ENV.DRIVER_URL || "postgres://postgres:postgres@localhost:5432",
+    driverType: DriverConfig_DriverType.DRIVER_TYPE_POSTGRES,
+    connectionType: {
+      is: { oneofKind: "sharedPool", sharedPool: { sharedConnections: 10 } },
+    },
+    dbSpecific: { fields: [] },
+  },
+});
+
+// Parse SQL file into named sections
+const sections = parse_sql_with_groups(open(__ENV.SQL_FILE));
+
+export function setup() {
+  // Run cleanup and schema creation queries from the SQL file
+  Step("schema", () => {
+    sections["section cleanup"].forEach((q) => driver.runQuery(q, {}));
+    sections["section create_schema"].forEach((q) => driver.runQuery(q, {}));
+  });
+
+  // Bulk-load 100K accounts per scale factor using COPY protocol
+  Step("load", () => {
+    driver.insert("pgbench_accounts", ACCOUNTS, {
+      method: InsertMethod.COPY_FROM,
+      params: {
+        aid: S.int32(1, ACCOUNTS),     // sequential primary key
+        bid: R.int32(1, SCALE),         // random branch reference
+        abalance: R.int32(0),           // starting balance
+        filler: R.str(84),              // padding
+      },
+    });
+  });
+}
+
+// Standalone generators for the hot loop
+const aidGen = NewGen(5, R.int32(1, ACCOUNTS));
+const deltaGen = NewGen(8, R.int32(-5000, 5000));
+
+export function tpcb() {
+  // Each VU calls this repeatedly for the duration of the test
+  driver.runQuery("SELECT tpcb_transaction(:aid, :tid, :bid, :delta)", {
+    aid: aidGen.next(),
+    tid: NewGen(6, R.int32(1, 10 * SCALE)).next(),
+    bid: NewGen(7, R.int32(1, SCALE)).next(),
+    delta: deltaGen.next(),
+  });
+}
+
+export function teardown() {
+  Teardown();
+}
+```
+
+The pattern here is typical: `setup()` uses structured SQL files and `insert()` with `S`/`R` rules to prepare the database, then the workload function uses standalone `NewGen` generators to feed parameterized queries in a tight loop.
+
+## DDL and Insert in Harmony: TPC-C
+
+The TPC-C workload is where the generator syntax really shines. Look at how the SQL schema and the TypeScript inserts mirror each other.
+
+The SQL defines the `customer` table:
+
+```sql
+CREATE TABLE customer (
+  c_id INTEGER,
+  c_d_id INTEGER,
+  c_w_id INTEGER REFERENCES warehouse(w_id),
+  c_first VARCHAR(16),
+  c_middle CHAR(2),
+  c_last VARCHAR(16),
+  c_street_1 VARCHAR(20),
+  c_street_2 VARCHAR(20),
+  c_city VARCHAR(20),
+  c_state CHAR(2),
+  c_zip CHAR(9),
+  c_phone CHAR(16),
+  c_since TIMESTAMP,
+  c_credit CHAR(2),
+  c_credit_lim DECIMAL(12,2),
+  c_discount DECIMAL(4,4),
+  c_balance DECIMAL(12,2),
+  c_ytd_payment DECIMAL(12,2),
+  c_payment_cnt INTEGER,
+  c_delivery_cnt INTEGER,
+  c_data VARCHAR(500),
+  PRIMARY KEY (c_w_id, c_d_id, c_id)
+);
+```
+
+And the insert reads like a declaration of what data each column should hold:
+
+```typescript
+driver.insert("customer", TOTAL_CUSTOMERS, {
+  method: InsertMethod.COPY_FROM,
+  params: {
+    c_first: R.str(8, 16),                        // VARCHAR(16)
+    c_middle: R.str(2, AB.enUpper),                // CHAR(2)
+    c_last: S.str(6, 16),                          // unique last names
+    c_street_1: R.str(10, 20, AB.enNumSpc),        // VARCHAR(20)
+    c_street_2: R.str(10, 20, AB.enNumSpc),
+    c_city: R.str(10, 20, AB.enSpc),
+    c_state: R.str(2, AB.enUpper),                 // CHAR(2)
+    c_zip: R.str(9, AB.num),                       // CHAR(9), digits only
+    c_phone: R.str(16, AB.num),                    // CHAR(16), digits only
+    c_since: R.datetimeConst(new Date()),
+    c_credit: R.str("GC"),
+    c_credit_lim: R.float(50000),
+    c_discount: R.float(0, 0.5),                   // DECIMAL(4,4)
+    c_balance: R.float(-10),
+    c_ytd_payment: R.float(10),
+    c_payment_cnt: R.int32(1),
+    c_delivery_cnt: R.int32(0),
+    c_data: R.str(300, 500, AB.enNumSpc),          // VARCHAR(500)
+  },
+  groups: {
+    customer_pk: {                                  // PRIMARY KEY (c_w_id, c_d_id, c_id)
+      c_d_id: S.int32(1, DISTRICTS_PER_WAREHOUSE),
+      c_w_id: S.int32(1, WAREHOUSES),
+      c_id: S.int32(1, CUSTOMERS_PER_DISTRICT),
+    },
+  },
+});
+```
+
+Every generation rule maps directly to the column's SQL type and constraints. `VARCHAR(16)` becomes `R.str(8, 16)`. `CHAR(9)` zip codes become `R.str(9, AB.num)`. The composite primary key `(c_w_id, c_d_id, c_id)` goes into a `groups` block where each component is a `S.int32` sequence, ensuring unique tuples via Cartesian product.
+
+The full TPC-C workload loads 9 tables this way, then runs 5 concurrent transaction types (new_order, payments, order_status, delivery, stock_level) at a realistic mix ratio &mdash; all in about 270 lines of TypeScript.
+
+## Distribution Types
+
+Under the hood, generators support three statistical distributions:
+
+| Distribution | Use case | Behavior |
+|-------------|----------|----------|
+| **Uniform** | Default. Equal probability across the range | Every value equally likely |
+| **Normal** | Realistic clustering around a mean | Bell curve distribution |
+| **Zipfian** | Hot-spot simulation (80/20 rule) | Few values accessed very frequently |
+
+These are most useful when building custom workloads that need realistic access patterns &mdash; for example, a Zipfian distribution on account IDs simulates the real-world pattern where a small number of accounts see the majority of activity.
