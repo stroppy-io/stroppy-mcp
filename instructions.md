@@ -239,6 +239,40 @@ At high connection counts (hundreds), PostgreSQL's process-per-connection model 
 
 For benchmarking: the parameter sweep that found a 14x bottleneck was caused by pool starvation — 198 VUs sharing 100 connections. Always pass `POOL_SIZE` equal to or greater than VUs, and ensure `max_connections` accommodates it.
 
+### Replication
+
+PostgreSQL's streaming replication ships WAL records from primary to standbys. The standby replays them the same way it would during crash recovery — a single process applying records sequentially. This replay is the replication throughput ceiling: no matter how many CPU cores the standby has, replay is single-threaded.
+
+**Synchronous replication** makes the primary wait for standby confirmation before returning COMMIT to the client. Three confirmation levels exist: receive (standby got the WAL), flush (standby wrote it to disk), apply (standby replayed it — data visible to read queries). Each level adds more latency to writes on the primary. With synchronous replication, write throughput is bounded by the slowest standby. If the synchronous standby goes down, the primary stalls — no writes commit anywhere.
+
+**Asynchronous replication** decouples the primary from standby health. The primary commits without waiting. Standbys lag behind by some amount. On failover, any transactions committed on the primary but not yet replayed on the standby are lost — the "replication window."
+
+**Hot standbys** can serve read-only queries while replaying WAL. But queries always see the past — how far in the past depends on replication lag. Each read transaction sees a self-consistent snapshot (no torn transactions), but the snapshot may be seconds or minutes behind the primary.
+
+**Logical replication** ships per-row changes rather than physical WAL. This enables selective table replication and cross-version setups, but has an amplification problem: a single bulk UPDATE affecting a million rows on the primary generates a million individual row updates on the standby. Physical (WAL) replication has no such amplification — bulk operations replay at roughly the same cost.
+
+For benchmarking: synchronous vs. asynchronous is the single most important variable for write latency distribution under replication. A workload that looks fine with async may become unusable under sync replication with a high-latency standby link. When testing read-scaling on standbys, measure replication lag alongside read throughput — high read QPS on a standby means nothing if the data is minutes stale. If the workload includes bulk operations, expect lag spikes under logical replication that don't appear under streaming replication.
+
+### Parallel query
+
+PostgreSQL's parallel query splits a single query's work across multiple worker processes on the same machine (shared-memory architecture). The optimizer extracts a sub-plan for parallel execution; a "gather" node collects results from workers and feeds them into the remaining sequential portion.
+
+Operations that parallelize: sequential scans, index range scans, bitmap scans, nested loop/hash/merge joins, and aggregation. Operations that don't: writes (INSERT/UPDATE/DELETE), and anything calling functions not marked `PARALLEL SAFE`. If a workload uses user-defined functions without this marking, the optimizer silently falls back to sequential plans — a common reason parallel speedup doesn't materialize.
+
+Parallel workers share a hash table for parallel hash joins (built cooperatively during the distribution phase, probed in parallel). Parallel merge join has a limitation: each worker reads the entire inner (second) input. Parallel sort is not implemented.
+
+For benchmarking: parallel query is a read-path optimization only. Write-heavy OLTP workloads get zero benefit. For read-heavy analytical queries, the speedup depends on the number of workers, data skew (uneven partition sizes stall some workers while others finish), and whether blocking operators (like hash table build) dominate. Adding more workers does not linearly reduce latency. Also, on multicore machines, memory bandwidth can saturate before CPU does — many cores sharing one memory bus hit a ceiling that more parallelism can't push past.
+
+### Distributed PostgreSQL and two-phase commit
+
+PostgreSQL connects to remote instances via Foreign Data Wrappers (FDW). The optimizer can push filter predicates and co-located joins to remote servers, but **`postgres_fdw` does not support distributed transactions.** Writes to multiple foreign servers within one transaction are not atomically committed — some may commit while others abort.
+
+For systems that do implement distributed transactions (extensions, forks, or middleware like Citus), the standard protocol is **two-phase commit (2PC)**. Phase 1: coordinator asks all participants to prepare — each writes a prepare record to WAL and votes ready-or-abort. Phase 2: coordinator sends the final commit-or-abort decision. The common belief that 2PC is inherently slow due to message round-trips is mostly wrong — the real latency problem is timeout paths when a participant is slow or dead. But locks held during the prepare phase block other transactions touching the same rows for the entire 2PC duration, which indirectly throttles concurrent throughput.
+
+**Isolation level is a throughput multiplier in distributed systems.** Snapshot Isolation (Read Committed / Repeatable Read) can be implemented with local-only consistency checks plus clock synchronization, achieving orders of magnitude higher throughput than Serializable, which requires global lock coordination. Always control and report the isolation level when benchmarking distributed setups.
+
+For benchmarking: the dominant cost in distributed queries is data transfer volume — a well-filtered query ships little data, a full-table join across nodes ships everything. Partition/shard key choice determines whether queries are local (single-node) or distributed (cross-node). A benchmark that only hits co-located data dramatically understates the real cost of distribution. Synthetic uniform data hides skew problems that production workloads will trigger — skewed key distributions reveal how the system handles uneven load across nodes.
+
 ## OrioleDB
 
 OrioleDB is a storage engine for PostgreSQL that replaces the heap with a fundamentally different architecture. It plugs in through PostgreSQL's table and index access method hooks — queries, planners, and SQL remain unchanged, but the storage layer behaves differently. Understanding these differences is essential for interpreting benchmark results when testing OrioleDB.
@@ -251,7 +285,9 @@ This has cascading consequences: no separate heap file, no CTID-based tuple addr
 
 Secondary indexes store copies of the indexed columns plus the primary key, not heap CTIDs. A lookup through a secondary index requires a second B-tree traversal (into the primary key tree) to retrieve non-indexed columns — similar to InnoDB's "bookmark lookup." This makes secondary index lookups more expensive than in heap-based PostgreSQL, where a single CTID fetch suffices.
 
-For benchmarking: workloads dominated by primary key lookups (point reads, range scans by PK) benefit significantly. Workloads that heavily use secondary indexes for non-covering queries may not see the same gains. The absence of a heap also eliminates heap bloat entirely — there are no dead heap tuples to accumulate.
+Unlike PostgreSQL's B-trees (which split but never merge), OrioleDB's B-tree pages **merge** when they become underfilled. This eliminates index bloat — a persistent problem in PostgreSQL where delete-heavy workloads leave B-tree indexes permanently oversized until REINDEX.
+
+For benchmarking: workloads dominated by primary key lookups (point reads, range scans by PK) benefit significantly. Workloads that heavily use secondary indexes for non-covering queries may not see the same gains. The absence of a heap eliminates heap bloat, and page merging eliminates index bloat — OrioleDB tables don't degrade over time the way PostgreSQL tables do under churn.
 
 ### Dual pointers and the buffer mapping problem
 
@@ -259,7 +295,7 @@ PostgreSQL's buffer cache uses a central hash table (the buffer mapping table) t
 
 OrioleDB eliminates the buffer mapping entirely. Each B-tree page carries two pointers: a **disk pointer** (offset in the data file) and a **memory pointer** (direct address in shared memory when the page is loaded). When traversing the tree, if the memory pointer is valid, OrioleDB follows it directly — no hash lookup, no lwlock. If the page isn't in memory, it loads from disk using the disk pointer and sets the memory pointer.
 
-This "dual pointer" design means that for hot working sets, tree traversal is essentially pointer chasing through shared memory with no synchronization overhead beyond the page-level locks. The deeper the tree and the more concurrent the access, the bigger the advantage over PostgreSQL's centralized buffer mapping.
+This "dual pointer" design means that for hot working sets, tree traversal is essentially pointer chasing through shared memory — in-memory page reads don't even require atomic operations. The deeper the tree and the more concurrent the access, the bigger the advantage over PostgreSQL's centralized buffer mapping. This is specifically designed to scale on modern servers with dozens to hundreds of CPU cores, where the buffer mapping lwlock becomes a serialization point.
 
 For benchmarking: the dual-pointer advantage is most visible at high concurrency (hundreds of VUs) on workloads with high page access rates. At low concurrency, the buffer mapping isn't a bottleneck and the difference is negligible.
 
@@ -279,11 +315,17 @@ For benchmarking: OrioleDB should show more stable throughput over time because 
 
 PostgreSQL WAL is page-oriented: after a checkpoint, the first modification to any page writes a **full page image** (8 KB) into WAL to protect against torn pages. This means WAL volume is often 60-70% full page images, especially right after a checkpoint.
 
-OrioleDB writes **row-level WAL records** — only the changed data, not entire pages. Torn page protection comes from the copy-on-write checkpoint mechanism (see below) rather than full page images. This dramatically reduces WAL volume for workloads with small row modifications on large pages.
+OrioleDB writes **row-level WAL records** — only the changed data, not entire pages. The WAL vocabulary is entirely logical: transaction start, row insert, row update, row delete, commit, abort. There are zero page-level records. Torn page protection comes from the copy-on-write checkpoint mechanism (see below) rather than full page images. Benchmarks report **22x less WAL IOPS** compared to standard PostgreSQL.
 
-Row-level WAL also enables parallel recovery: undo records are partitioned by primary key hash, so recovery can process different key ranges concurrently.
+Secondary indexes are not WAL-logged at all — they are reconstructed during recovery. This means the WAL stream is independent of index structure and portable across nodes with different index configurations.
 
-For benchmarking: write-heavy workloads should show lower WAL volume and potentially higher throughput on storage-constrained systems. The difference is largest for workloads that do many small updates to large tables (many rows per page, each update touching few columns).
+**Parallel recovery** distributes WAL replay across multiple workers by `hash(primary_key)`. This is not per-transaction distribution — a single large transaction gets split across workers, each owning a disjoint key range. Transaction visibility to readers is deferred until all participating workers finish. This architecture maps directly to a sharded replication model: replace "recovery workers" with "shard nodes."
+
+**Logical decoding** already works for OrioleDB tables — they can participate in PostgreSQL logical replication today. Replication origin filtering (needed for bidirectional/multimaster setups to avoid infinite loops) is implemented. Synchronous replication feedback records exist for `synchronous_commit >= remote_apply`.
+
+Row-level WAL is designed for **raft consensus-based active-active multimaster** replication. Conflict resolution operates on individual rows rather than physical pages, and consensus can replicate row changes without page-level coordination. This is explicitly planned but not yet implemented — no details are published about the specific Raft variant, conflict resolution strategy, or whether it will be synchronous or asynchronous.
+
+For benchmarking: write-heavy workloads should show dramatically lower WAL volume and higher throughput on storage-constrained systems. When testing under replication, OrioleDB's parallel WAL replay scales with recovery workers — PostgreSQL's page-level WAL replays sequentially on a single process, which often makes the replica the bottleneck. Skewed workloads that concentrate writes on a small key range will bottleneck fewer replay workers, so key distribution matters for replication throughput testing. Multimaster benchmarking is not possible today.
 
 ### Copy-on-write checkpoints
 
@@ -297,6 +339,20 @@ OrioleDB maintains two "checkpoints" (even/odd) and alternates between them, sim
 
 For benchmarking: checkpoint-related throughput dips that are common in PostgreSQL write benchmarks (periodic latency spikes every `checkpoint_timeout` seconds) should be less pronounced or absent with OrioleDB.
 
+### S3 decoupled storage
+
+OrioleDB has an experimental **compute-storage separation** mode built on S3. Local disk acts as a write-through cache — writes happen at local storage speed, and a pool of background workers asynchronously syncs changes to S3. On each checkpoint, only modified blocks are incrementally uploaded. Data files are split into **1 MB parts**, independently fetchable and evictable — true sparse caching of datasets larger than local storage.
+
+When local cache exceeds `s3_desired_size`, the background writer evicts cold parts (usage-count-based clock sweep, similar to PostgreSQL's buffer cache eviction). Evicted parts are zeroed locally (sparse file holes) and re-fetched from S3 on demand. When a non-leaf B-tree page is loaded from S3, OrioleDB **eagerly prefetches all its children** to amortize S3 latency for tree traversals.
+
+WAL files are archived to S3 via PostgreSQL's archive module. Undo logs and data files ship separately. A fresh PostgreSQL instance can reconnect to an existing S3 bucket and recover all data from the last checkpoint.
+
+**Current limitations**: only one database instance can connect to an S3 bucket at a time (enforced via S3 conditional PUT lock file). Primary-replica setups require separate buckets. Old checkpoint history accumulates in S3 with no GC yet. This is **not** shared-storage multi-compute — it's a single-writer persistence/recovery tier with local caching.
+
+This contrasts with Neon's architecture, where every read goes through the network to a remote page server. OrioleDB reads from local storage (or local cache); S3 is only hit on cache misses and checkpoint sync. Write latency stays at local-disk speed, not S3 speed.
+
+For benchmarking: S3 mode benchmarks are single-instance only. The key tuning knobs are `s3_num_workers` (recommended 20 — controls upload parallelism) and `s3_desired_size` (local cache threshold). Undersizing the cache creates eviction pressure and S3 read latency on misses. Interesting measurements: checkpoint-to-S3 sync latency, read performance with varying cache sizes, cold-start recovery time from S3. You cannot currently benchmark shared-storage multi-compute or multiple instances against the same bucket.
+
 ### Bridged indexes
 
 When a table is created with `USING orioledb`, its primary index uses OrioleDB's B-tree. But secondary indexes can be either OrioleDB B-trees or standard PostgreSQL B-trees ("bridged indexes"). Bridged indexes allow OrioleDB to leverage PostgreSQL's existing index types (GiST, GIN, BRIN, etc.) that haven't been reimplemented in the OrioleDB engine.
@@ -307,8 +363,10 @@ For benchmarking: if the workload relies on non-B-tree index types, those will u
 
 When the user benchmarks OrioleDB against standard PostgreSQL:
 
-- **Expect PK-heavy workloads to favor OrioleDB.** Index-organized tables eliminate the heap fetch. Reported improvements on TPC-C range from 2x to 5x depending on concurrency and configuration.
-- **Expect write-heavy workloads to show more stable latency.** No autovacuum pauses, no full page image bursts after checkpoints, no table bloat.
+- **Expect PK-heavy workloads to favor OrioleDB.** Index-organized tables eliminate the heap fetch. Published TPC-C results: 2.3-5.5x faster (beta7, 64-core ARM), 22-162% faster (beta12, varying instance sizes). Largest gains appear at higher core counts where PostgreSQL's buffer mapping becomes a bottleneck.
+- **Expect write-heavy workloads to show more stable latency.** No autovacuum pauses, no full page image bursts after checkpoints, no table bloat. WAL IOPS reported 22x lower.
 - **Expect secondary index lookups to be comparable or slightly slower.** The extra PK tree traversal (bookmark lookup) adds cost that PostgreSQL's direct CTID fetch avoids.
+- **Expect replication lag advantages.** Compact row-level WAL reduces replication bandwidth. Parallel replay on standbys removes PostgreSQL's single-process replay bottleneck. No published replication benchmarks exist yet — this is an open area for testing.
 - **Don't compare stock PostgreSQL against OrioleDB.** Tune PostgreSQL properly first (shared_buffers, effective_cache_size, random_page_cost, WAL settings). An untuned PostgreSQL baseline makes OrioleDB look artificially better.
 - **Watch for extension maturity issues.** OrioleDB is younger than PostgreSQL's heap engine. Edge cases, crash recovery behavior, and replication compatibility may differ. Benchmark results that seem too good (or too bad) warrant investigation into whether the test exercised a known limitation.
+- **Multimaster is not available yet.** Active-active replication via raft consensus is on the roadmap but not implemented. The only multi-node configuration testable today is standard PostgreSQL streaming replication with OrioleDB's enhanced WAL.
