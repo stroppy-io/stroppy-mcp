@@ -1,5 +1,8 @@
 # stroppy-mcp
 
+[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/2mSSrkBkHm)
+[![Docs](https://img.shields.io/badge/docs-stroppy--io.github.io-blue)](https://stroppy-io.github.io)
+
 MCP server that gives AI assistants direct access to [Stroppy](https://github.com/stroppy-io/stroppy), a k6-based database stress testing tool. Instead of constructing shell commands and parsing terminal output, the assistant calls structured tools — inspect a database, scaffold a test workspace, run a benchmark, read the results.
 
 ```
